@@ -86,12 +86,47 @@ def _calibrate_width(y: np.ndarray, qp: dict, target: float = TARGET_COVERAGE) -
     return 3.5
 
 
-def _fit_calibrated(train: pd.DataFrame, calib_days: int = 21):
-    """Fit models on full train; learn the conformal width on a held-out tail."""
+def _calibrate_width_by_hour(
+    y: np.ndarray, qp: dict, hours: np.ndarray, target: float = TARGET_COVERAGE,
+    min_points: int = 8,
+) -> dict:
+    """One conformal width multiplier per hour of day.
+
+    The per-day error-by-hour analysis shows the interval is too narrow in the
+    volatile midday hours and too wide overnight, so a single global multiplier
+    can't hit 80% coverage everywhere. This learns k separately for each hour on
+    the held-out calibration window. Hours with too few calibration points fall
+    back to the global multiplier so a thin bucket can't produce a wild width.
+    """
+    global_k = _calibrate_width(y, qp, target)
+    q10, q50, q90 = qp[0.1], qp[0.5], qp[0.9]
+    ks = {}
+    for h in range(24):
+        mask = hours == h
+        if mask.sum() < min_points:
+            ks[h] = global_k
+            continue
+        ks[h] = _calibrate_width(
+            y[mask], {0.1: q10[mask], 0.5: q50[mask], 0.9: q90[mask]}, target
+        )
+    return ks
+
+
+def _fit_calibrated(train: pd.DataFrame, calib_days: int = 21, by_hour: bool = False):
+    """Fit models on full train; learn the conformal width on a held-out tail.
+
+    Returns ``k`` as a single float (global calibration) or a ``{hour: k}`` dict
+    (hour-conditional calibration).
+    """
     n_calib = calib_days * 24
     inner, calib = train.iloc[:-n_calib], train.iloc[-n_calib:]
     _, quant_inner = _fit_set(inner)
-    k = _calibrate_width(calib["price_eur_mwh"].to_numpy(), _quantile_prices(quant_inner, calib))
+    qp_calib = _quantile_prices(quant_inner, calib)
+    y_calib = calib["price_eur_mwh"].to_numpy()
+    if by_hour:
+        k = _calibrate_width_by_hour(y_calib, qp_calib, calib.index.hour.to_numpy())
+    else:
+        k = _calibrate_width(y_calib, qp_calib)
     point, quantiles = _fit_set(train)   # deploy on all data
     return point, quantiles, k
 
@@ -99,14 +134,26 @@ def _fit_calibrated(train: pd.DataFrame, calib_days: int = 21):
 # --------------------------------------------------------------------------- #
 # Walk-forward backtest                                                       #
 # --------------------------------------------------------------------------- #
-def backtest(df: pd.DataFrame, test_days: int = 28, retrain_every: int = 7) -> pd.DataFrame:
+def backtest(
+    df: pd.DataFrame, test_days: int = 28, retrain_every: int = 7,
+    calibration: str = "global",
+) -> pd.DataFrame:
     """Expanding-window walk-forward evaluation over the last ``test_days``.
 
     For each delivery day the model has only ever seen data strictly before that
     day (no leakage); it is refit every ``retrain_every`` days to mimic a desk
     that periodically retrains. Returns an hourly frame with the actual price,
     the naive-24h benchmark, the point forecast and the calibrated P10/P50/P90.
+
+    ``calibration`` is ``"global"`` (a single conformal width; the default) or
+    ``"hourly"`` (a width per hour of day). Both learn the width only on a
+    held-out tail the models never trained on. Global is the default because,
+    on a 21-day calibration window, the per-hour version overfits — it flattens
+    the hourly coverage spread slightly but *worsens* the pinball loss and drops
+    overall coverage below target (see the README experiment). ``"hourly"`` is
+    kept for when more calibration history is available.
     """
+    by_hour = calibration == "hourly"
     cutoff = df.index.max().normalize() - pd.Timedelta(days=test_days - 1)
     test_index = df.index[df.index >= cutoff]
     days = sorted({d.normalize() for d in test_index})
@@ -118,13 +165,14 @@ def backtest(df: pd.DataFrame, test_days: int = 28, retrain_every: int = 7) -> p
     point = quantiles = k = None
     for i, day in enumerate(days):
         if i % retrain_every == 0:
-            point, quantiles, k = _fit_calibrated(df[df.index < day])
+            point, quantiles, k = _fit_calibrated(df[df.index < day], by_hour=by_hour)
         rows = df[(df.index >= day) & (df.index < day + pd.Timedelta(days=1))]
         qp = _quantile_prices(quantiles, rows)
+        kk = np.array([k[h] for h in rows.index.hour]) if by_hour else k
         preds.loc[rows.index, "point"] = rows["lag_24"].to_numpy() + point.predict(rows[FEATURES])
         preds.loc[rows.index, "q50"] = qp[0.5]
-        preds.loc[rows.index, "q10"] = qp[0.5] - k * (qp[0.5] - qp[0.1])   # conformal widen
-        preds.loc[rows.index, "q90"] = qp[0.5] + k * (qp[0.9] - qp[0.5])
+        preds.loc[rows.index, "q10"] = qp[0.5] - kk * (qp[0.5] - qp[0.1])   # conformal widen
+        preds.loc[rows.index, "q90"] = qp[0.5] + kk * (qp[0.9] - qp[0.5])
 
     preds[["q10", "q50", "q90"]] = np.sort(preds[["q10", "q50", "q90"]].to_numpy(), axis=1)
     return preds

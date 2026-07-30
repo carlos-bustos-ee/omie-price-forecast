@@ -70,10 +70,27 @@ hour of day tells the real story:
   helps most.
 - **Coverage is honest but not flat.** The P10–P90 band averages ~80% but runs from **68%**
   in the most volatile midday hours to **>90%** in the quiet ones — i.e. the interval is a
-  touch narrow precisely when volatility peaks. That is a concrete, measured motivation for
-  the hour-conditional calibration on the roadmap, not a guess.
+  touch narrow precisely when volatility peaks.
 
 Numbers per hour are in `results/metrics_by_hour.csv`.
+
+### Experiment: does hour-conditional calibration help? (No — and that's the point)
+
+The uneven coverage above is an obvious invitation to calibrate the conformal width **per
+hour** instead of globally. It's implemented (`backtest(..., calibration="hourly")`) and I
+tested it head-to-head on the same models:
+
+| Calibration | Pinball ↓ | Overall coverage | Hourly coverage spread (mean \|cov−80%\|) |
+|---|---|---|---|
+| **Global (shipped)** | **5.29** | 81.4% | 6.3 pp |
+| Hourly | 5.69 | 77.5% | 5.3 pp |
+
+Per-hour calibration flattens the hourly spread a little, but on a **21-day** calibration
+window it **overfits**: the proper scoring rule (pinball) gets *worse* and overall coverage
+falls below the 80% target. So the shipped default stays **global**, and the hourly option
+is kept for when there's enough calibration history (or a shrinkage prior toward the global
+width) to estimate 24 multipliers without overfitting. Rejecting a plausible idea on
+out-of-sample evidence is the point — not every added knob is an improvement.
 
 ## Data
 
@@ -111,9 +128,10 @@ src/
   (REE); the biggest remaining lever on point error.
 - **Benchmark vs. the literature** — compare against LEAR / DNN from
   [`epftoolbox`](https://github.com/jeslago/epftoolbox) with a Diebold–Mariano test.
-- **Hour-conditional conformal calibration** — the coverage-by-hour analysis above shows
-  the band is too narrow midday and too wide overnight; calibrating the width per hour
-  should flatten coverage to the 80% target across the day.
+- **Hour-conditional conformal calibration with shrinkage** — the per-hour version is
+  implemented but overfits a 21-day window (see the experiment above); the next step is to
+  shrink each hour's width toward the global one, or calibrate on more history, so the 24
+  multipliers stop chasing noise.
 - **Rolling-origin backtest across full seasons** (this window is 28 days of summer; a
   full-year rolling origin would test the model through the seasonal price regimes).
 
