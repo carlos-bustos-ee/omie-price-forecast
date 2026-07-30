@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import LassoCV
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 REL_LAGS = (48, 72, 168)
 QUANTILES = (0.1, 0.5, 0.9)
@@ -74,6 +78,21 @@ def _fit_set(train: pd.DataFrame) -> tuple[HistGradientBoostingRegressor, dict]:
 def _quantile_prices(quantiles: dict, rows: pd.DataFrame) -> dict:
     anchor = rows["lag_24"].to_numpy()
     return {q: anchor + quantiles[q].predict(rows[FEATURES]) for q in QUANTILES}
+
+
+def _fit_lasso(train: pd.DataFrame):
+    """Regularized linear autoregressive baseline (standardized features + LASSO,
+    alpha chosen by cross-validation). This is the workhorse benchmark of the
+    electricity-price-forecasting literature (the linear half of Lago et al.'s
+    LEAR); it predicts the same DELTA target as the gradient boosting model, so
+    the two are directly comparable and both are beatable only by genuinely
+    modelling the correction on top of the naive forecast."""
+    model = make_pipeline(
+        StandardScaler(),
+        LassoCV(cv=5, max_iter=10000, random_state=42),
+    )
+    model.fit(train[FEATURES], train["target_delta"])
+    return model
 
 
 def _calibrate_width(y: np.ndarray, qp: dict, target: float = TARGET_COVERAGE) -> float:
@@ -162,14 +181,18 @@ def backtest(
     preds["actual"] = df.loc[test_index, "price_eur_mwh"]
     preds["naive_24h"] = df.loc[test_index, "lag_24"]
 
-    point = quantiles = k = None
+    point = quantiles = k = lasso = None
     for i, day in enumerate(days):
         if i % retrain_every == 0:
-            point, quantiles, k = _fit_calibrated(df[df.index < day], by_hour=by_hour)
+            train = df[df.index < day]
+            point, quantiles, k = _fit_calibrated(train, by_hour=by_hour)
+            lasso = _fit_lasso(train)
         rows = df[(df.index >= day) & (df.index < day + pd.Timedelta(days=1))]
         qp = _quantile_prices(quantiles, rows)
         kk = np.array([k[h] for h in rows.index.hour]) if by_hour else k
-        preds.loc[rows.index, "point"] = rows["lag_24"].to_numpy() + point.predict(rows[FEATURES])
+        anchor = rows["lag_24"].to_numpy()
+        preds.loc[rows.index, "point"] = anchor + point.predict(rows[FEATURES])
+        preds.loc[rows.index, "lasso"] = anchor + lasso.predict(rows[FEATURES])
         preds.loc[rows.index, "q50"] = qp[0.5]
         preds.loc[rows.index, "q10"] = qp[0.5] - kk * (qp[0.5] - qp[0.1])   # conformal widen
         preds.loc[rows.index, "q90"] = qp[0.5] + kk * (qp[0.9] - qp[0.5])
@@ -189,8 +212,9 @@ def _pinball(y: pd.Series, yhat: pd.Series, q: float) -> float:
 def score(preds: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Point metrics (MAE/RMSE vs the naive-24h benchmark) plus probabilistic metrics."""
     y = preds["actual"]
+    names = [c for c in ["naive_24h", "lasso", "point"] if c in preds.columns]
     rows = []
-    for name in ["naive_24h", "point"]:
+    for name in names:
         err = preds[name] - y
         rows.append(
             {
@@ -241,3 +265,55 @@ def score_by_hour(preds: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows).set_index("hour")
+
+
+# --------------------------------------------------------------------------- #
+# Statistical significance                                                    #
+# --------------------------------------------------------------------------- #
+def diebold_mariano(actual, pred_a, pred_b, hac_lag: int = 24, loss: str = "abs"):
+    """Diebold-Mariano test on the loss differential of forecast A vs B.
+
+    A headline "-15% MAE" is worthless if it isn't distinguishable from noise.
+    Hourly forecast errors are strongly autocorrelated, so the *effective* sample
+    is far smaller than the raw hour count; using a naive variance would badly
+    overstate significance. This uses a Newey-West (Bartlett-kernel, ``hac_lag``)
+    long-run variance and a standard-normal reference. A **negative** statistic
+    means A has the lower average loss (A is better). Returns ``(stat, p_value)``.
+    """
+    a = np.asarray(actual, float)
+    d = np.abs(a - np.asarray(pred_a, float)) - np.abs(a - np.asarray(pred_b, float))
+    if loss == "squared":
+        d = (a - np.asarray(pred_a, float)) ** 2 - (a - np.asarray(pred_b, float)) ** 2
+    n = len(d)
+    dm0 = d - d.mean()
+    lrv = np.mean(dm0 ** 2)
+    for lag in range(1, hac_lag + 1):
+        cov = np.mean(dm0[lag:] * dm0[:-lag])
+        lrv += 2.0 * (1.0 - lag / (hac_lag + 1.0)) * cov   # Bartlett weight
+    stat = float(d.mean() / np.sqrt(lrv / n))
+    p = float(2.0 * stats.norm.cdf(-abs(stat)))
+    return stat, p
+
+
+def significance_tests(preds: pd.DataFrame, hac_lag: int = 24) -> pd.DataFrame:
+    """Run the Diebold-Mariano tests that matter: is the gradient boosting model
+    significantly better than the naive benchmark and than the LASSO baseline,
+    and does the LASSO itself beat naive? Absolute-error loss, HAC variance."""
+    y = preds["actual"].to_numpy()
+    pairs = [("point", "naive_24h"), ("point", "lasso"), ("lasso", "naive_24h")]
+    rows = []
+    for a, b in pairs:
+        if a not in preds.columns or b not in preds.columns:
+            continue
+        stat, p = diebold_mariano(y, preds[a].to_numpy(), preds[b].to_numpy(), hac_lag=hac_lag)
+        rows.append(
+            {
+                "comparison": f"{a} vs {b}",
+                "mae_a": round(float((preds[a] - preds["actual"]).abs().mean()), 3),
+                "mae_b": round(float((preds[b] - preds["actual"]).abs().mean()), 3),
+                "dm_stat": round(stat, 3),
+                "p_value": p,
+                "a_better_at_5pct": bool(stat < 0 and p < 0.05),
+            }
+        )
+    return pd.DataFrame(rows)

@@ -1,0 +1,4 @@
+comparison,mae_a,mae_b,dm_stat,p_value,a_better_at_5pct
+point vs naive_24h,15.369,16.277,-1.342,0.17961601718604792,False
+point vs lasso,15.369,15.825,-1.195,0.23227643052621094,False
+lasso vs naive_24h,15.825,16.277,-0.856,0.39205150034079594,False

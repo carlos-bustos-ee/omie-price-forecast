@@ -1,5 +1,6 @@
 """End-to-end pipeline: download OMIE prices, build the dataset, run a
-walk-forward backtest of point + probabilistic forecasts, and plot the results.
+walk-forward backtest of point + probabilistic forecasts against a naive and a
+LASSO benchmark, test the differences with Diebold-Mariano, and plot the results.
 """
 from __future__ import annotations
 
@@ -14,37 +15,21 @@ import matplotlib.pyplot as plt
 
 from .dataset import build_series
 from .download import download_range
-from .forecast import backtest, make_features, score, score_by_hour
+from .forecast import backtest, make_features, score, score_by_hour, significance_tests
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--days", type=int, default=420, help="days of history to download")
-    parser.add_argument("--test-days", type=int, default=28, help="walk-forward window (days)")
-    parser.add_argument("--retrain-every", type=int, default=7, help="retrain cadence (days)")
-    args = parser.parse_args()
-
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=args.days - 1)
-    print(f"Downloading OMIE day-ahead prices {start} -> {end} ...")
-    paths = download_range(start, end)
-    print(f"  {len(paths)} daily files available")
-
-    series = build_series(paths)
-    processed = ROOT / "data" / "processed"
-    processed.mkdir(parents=True, exist_ok=True)
-    series.to_csv(processed / "prices_hourly_es.csv")
-    print(f"  {len(series)} hourly prices -> data/processed/prices_hourly_es.csv")
-
+def run(series, test_days: int = 120, retrain_every: int = 7) -> None:
+    """Backtest -> score -> significance -> save artifacts + plots. Takes a tidy
+    hourly price series so it can be driven from a live download or a cached CSV."""
     df = make_features(series)
-    print(f"  walk-forward backtest: last {args.test_days} days, retrain every "
-          f"{args.retrain_every} days ...")
-    preds = backtest(df, test_days=args.test_days, retrain_every=args.retrain_every)
+    print(f"  walk-forward backtest: last {test_days} days, retrain every "
+          f"{retrain_every} days ...")
+    preds = backtest(df, test_days=test_days, retrain_every=retrain_every)
     metrics, prob = score(preds)
-
     by_hour = score_by_hour(preds)
+    sig = significance_tests(preds)
 
     results = ROOT / "results"
     results.mkdir(exist_ok=True)
@@ -52,21 +37,28 @@ def main() -> None:
     metrics.to_csv(results / "metrics.csv", index=False)
     prob.to_csv(results / "metrics_probabilistic.csv", index=False)
     by_hour.to_csv(results / "metrics_by_hour.csv")
+    sig.to_csv(results / "significance_dm.csv", index=False)
+
     print()
     print(metrics.round(3).to_string(index=False))
     print()
     print(prob.to_string(index=False))
+    print()
+    print("Diebold-Mariano tests (abs-error loss, HAC variance):")
+    print(sig.to_string(index=False))
     print()
     print("Per-hour breakdown (naive vs model MAE, EUR/MWh):")
     print(by_hour.round(2).to_string())
 
     window = preds.tail(14 * 24)
 
-    # 1) point forecast vs actual vs naive
+    # 1) point forecast vs actual vs naive vs lasso
     fig, ax = plt.subplots(figsize=(13, 5))
     ax.plot(window.index, window["actual"], label="Actual", linewidth=1.4)
     ax.plot(window.index, window["point"], label="Gradient boosting (point)", linewidth=1.1)
-    ax.plot(window.index, window["naive_24h"], label="Naive 24h", linewidth=0.9, alpha=0.55)
+    ax.plot(window.index, window["lasso"], label="LASSO baseline", linewidth=0.9,
+            color="tab:green", alpha=0.7)
+    ax.plot(window.index, window["naive_24h"], label="Naive 24h", linewidth=0.9, alpha=0.5)
     ax.set_title("OMIE Spain day-ahead price — point forecast (last 14 days of backtest)")
     ax.set_ylabel("EUR/MWh")
     ax.legend()
@@ -96,7 +88,7 @@ def main() -> None:
     ax.fill_between(by_hour.index, by_hour["point_mae_eur_mwh"],
                     by_hour["naive_mae_eur_mwh"], color="tab:green", alpha=0.15,
                     label="MAE reduction (model gain)")
-    ax.set_title("OMIE Spain day-ahead price — error by hour of day (28-day backtest)")
+    ax.set_title(f"OMIE Spain day-ahead price — error by hour of day ({test_days}-day backtest)")
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("MAE (EUR/MWh)")
     ax.set_xticks(range(0, 24, 2))
@@ -116,6 +108,28 @@ def main() -> None:
 
     print("\nPlots -> results/forecast_point_last14d.png, results/forecast_fan_last14d.png, "
           "results/error_by_hour.png")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--days", type=int, default=420, help="days of history to download")
+    parser.add_argument("--test-days", type=int, default=120, help="walk-forward window (days)")
+    parser.add_argument("--retrain-every", type=int, default=7, help="retrain cadence (days)")
+    args = parser.parse_args()
+
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=args.days - 1)
+    print(f"Downloading OMIE day-ahead prices {start} -> {end} ...")
+    paths = download_range(start, end)
+    print(f"  {len(paths)} daily files available")
+
+    series = build_series(paths)
+    processed = ROOT / "data" / "processed"
+    processed.mkdir(parents=True, exist_ok=True)
+    series.to_csv(processed / "prices_hourly_es.csv")
+    print(f"  {len(series)} hourly prices -> data/processed/prices_hourly_es.csv")
+
+    run(series, test_days=args.test_days, retrain_every=args.retrain_every)
 
 
 if __name__ == "__main__":
