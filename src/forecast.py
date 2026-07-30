@@ -162,3 +162,34 @@ def score(preds: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
          {"metric": "coverage_P10_P90 (target 0.80)", "value": round(coverage, 3)}]
     )
     return metrics, prob
+
+
+def score_by_hour(preds: pd.DataFrame) -> pd.DataFrame:
+    """Break the backtest down by hour of day.
+
+    Electricity price forecasting is not uniformly hard across the day: the
+    solar-driven midday trough and the evening ramp behave very differently from
+    the flat overnight hours. This groups the out-of-sample predictions by hour
+    and reports, for each, the naive-24h MAE, the model MAE, the improvement the
+    model buys, and the empirical P10-P90 coverage — i.e. *where* the model adds
+    value and whether the uncertainty band stays honest across the day.
+    """
+    df = preds.copy()
+    df["hour"] = df.index.hour
+    rows = []
+    for hour, g in df.groupby("hour"):
+        y = g["actual"]
+        naive_mae = float((g["naive_24h"] - y).abs().mean())
+        point_mae = float((g["point"] - y).abs().mean())
+        cov = float(((y >= g["q10"]) & (y <= g["q90"])).mean())
+        rows.append(
+            {
+                "hour": int(hour),
+                "n_days": int(len(g)),
+                "naive_mae_eur_mwh": naive_mae,
+                "point_mae_eur_mwh": point_mae,
+                "improvement_pct": (1 - point_mae / naive_mae) * 100 if naive_mae else float("nan"),
+                "coverage_P10_P90": cov,
+            }
+        )
+    return pd.DataFrame(rows).set_index("hour")

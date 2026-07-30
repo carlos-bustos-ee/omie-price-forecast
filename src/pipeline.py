@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from .dataset import build_series
 from .download import download_range
-from .forecast import backtest, make_features, score
+from .forecast import backtest, make_features, score, score_by_hour
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,15 +44,21 @@ def main() -> None:
     preds = backtest(df, test_days=args.test_days, retrain_every=args.retrain_every)
     metrics, prob = score(preds)
 
+    by_hour = score_by_hour(preds)
+
     results = ROOT / "results"
     results.mkdir(exist_ok=True)
     preds.to_csv(results / "backtest_predictions.csv")
     metrics.to_csv(results / "metrics.csv", index=False)
     prob.to_csv(results / "metrics_probabilistic.csv", index=False)
+    by_hour.to_csv(results / "metrics_by_hour.csv")
     print()
     print(metrics.round(3).to_string(index=False))
     print()
     print(prob.to_string(index=False))
+    print()
+    print("Per-hour breakdown (naive vs model MAE, EUR/MWh):")
+    print(by_hour.round(2).to_string())
 
     window = preds.tail(14 * 24)
 
@@ -81,7 +87,35 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(results / "forecast_fan_last14d.png", dpi=150)
 
-    print("\nPlots -> results/forecast_point_last14d.png, results/forecast_fan_last14d.png")
+    # 3) error-by-hour: where the model beats naive, and coverage across the day
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.plot(by_hour.index, by_hour["naive_mae_eur_mwh"], "o-", color="tab:gray",
+            alpha=0.7, label="Naive 24h MAE")
+    ax.plot(by_hour.index, by_hour["point_mae_eur_mwh"], "o-", color="tab:blue",
+            label="Gradient boosting MAE")
+    ax.fill_between(by_hour.index, by_hour["point_mae_eur_mwh"],
+                    by_hour["naive_mae_eur_mwh"], color="tab:green", alpha=0.15,
+                    label="MAE reduction (model gain)")
+    ax.set_title("OMIE Spain day-ahead price — error by hour of day (28-day backtest)")
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel("MAE (EUR/MWh)")
+    ax.set_xticks(range(0, 24, 2))
+    ax.legend(loc="upper left")
+
+    ax2 = ax.twinx()
+    ax2.plot(by_hour.index, by_hour["coverage_P10_P90"] * 100, "s--", color="tab:orange",
+             alpha=0.6, linewidth=1.0, label="P10-P90 coverage")
+    ax2.axhline(80, color="tab:orange", linestyle=":", alpha=0.5)
+    ax2.set_ylabel("P10-P90 coverage (%)", color="tab:orange")
+    ax2.set_ylim(0, 105)
+    ax2.tick_params(axis="y", labelcolor="tab:orange")
+    ax2.legend(loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(results / "error_by_hour.png", dpi=150)
+
+    print("\nPlots -> results/forecast_point_last14d.png, results/forecast_fan_last14d.png, "
+          "results/error_by_hour.png")
 
 
 if __name__ == "__main__":
