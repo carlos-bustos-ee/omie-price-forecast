@@ -13,11 +13,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import pandas as pd
+
 from .dataset import build_series
 from .download import download_range
 from .exog import load_exog
+from .exog_entsoe import load_entsoe
 from .forecast import (
     BASE_FEATURES,
+    FR_EXOG_FEATURES,
     backtest,
     feature_columns,
     make_features,
@@ -40,15 +44,26 @@ def run(series, exog=None, test_days: int = 120, retrain_every: int = 7) -> None
     forecasts actually add, tested for significance with Diebold-Mariano.
     """
     df = make_features(series, exog=exog)
+    full_feats = feature_columns(df)
+    has_exog = full_feats != BASE_FEATURES
     print(f"  walk-forward backtest: last {test_days} days, retrain every "
-          f"{retrain_every} days ...")
+          f"{retrain_every} days ({len(full_feats)} features) ...")
+    # Headline model uses every available feature; probabilistic path always on.
     preds = backtest(df, test_days=test_days, retrain_every=retrain_every,
-                     features=feature_columns(df))
-    if exog is not None:
+                     features=full_feats, fit_lasso=not has_exog)
+    if has_exog:
+        # price-only baseline (point + the standard LEAR-style LASSO)
         base = backtest(df, test_days=test_days, retrain_every=retrain_every,
-                        features=BASE_FEATURES)
+                        features=BASE_FEATURES, fit_quantiles=False, fit_lasso=True)
         preds["point_price_only"] = base["point"]
-        preds["lasso"] = base["lasso"]  # report the standard price-only LEAR baseline
+        preds["lasso"] = base["lasso"]
+        # if France (ENTSO-E) features are present, isolate their contribution with
+        # an ESIOS-only leg, so `point` vs `point_es` is exactly the cross-border gain
+        es_feats = [c for c in full_feats if c not in FR_EXOG_FEATURES]
+        if es_feats != full_feats:
+            es = backtest(df, test_days=test_days, retrain_every=retrain_every,
+                          features=es_feats, fit_quantiles=False, fit_lasso=False)
+            preds["point_es"] = es["point"]
     metrics, prob = score(preds)
     by_hour = score_by_hour(preds)
     sig = significance_tests(preds)
@@ -77,7 +92,7 @@ def run(series, exog=None, test_days: int = 120, retrain_every: int = 7) -> None
     # 1) point forecast vs actual vs naive (+ the exogenous-features gain if present)
     fig, ax = plt.subplots(figsize=(13, 5))
     ax.plot(window.index, window["actual"], label="Actual", linewidth=1.4)
-    gbm_label = ("Gradient boosting (+ ESIOS forecasts)" if "point_price_only" in preds.columns
+    gbm_label = ("Gradient boosting (+ day-ahead forecasts)" if "point_price_only" in preds.columns
                  else "Gradient boosting (point)")
     ax.plot(window.index, window["point"], label=gbm_label, linewidth=1.1)
     if "point_price_only" in preds.columns:
@@ -141,7 +156,10 @@ def main() -> None:
     parser.add_argument("--test-days", type=int, default=120, help="walk-forward window (days)")
     parser.add_argument("--retrain-every", type=int, default=7, help="retrain cadence (days)")
     parser.add_argument("--no-exog", action="store_true",
-                        help="skip ESIOS exogenous forecasts (price-only model)")
+                        help="skip all exogenous forecasts (price-only model)")
+    parser.add_argument("--with-entsoe", action="store_true",
+                        help="also run the ENTSO-E France ablation (off by default: the "
+                             "leakage-safe French load adds no significant skill — see README)")
     args = parser.parse_args()
 
     end = date.today() - timedelta(days=1)
@@ -158,11 +176,23 @@ def main() -> None:
 
     exog = None
     if not args.no_exog:
+        s0, e0 = series.index.min().date(), series.index.max().date()
+        frames = []
         try:
-            exog = load_exog(series.index.min().date(), series.index.max().date())
-            print(f"  {len(exog)} hourly ESIOS forecasts (demand/wind/solar) -> data/exog/")
+            es = load_exog(s0, e0)
+            frames.append(es)
+            print(f"  {len(es)} hourly ESIOS forecasts (Spain demand/wind/solar) -> data/exog/")
         except Exception as err:  # no token and no cache -> fall back to price-only
-            print(f"  ESIOS forecasts unavailable ({err}); running price-only.")
+            print(f"  ESIOS forecasts unavailable ({err}).")
+        if args.with_entsoe:
+            try:
+                fr = load_entsoe(s0, e0)
+                frames.append(fr)
+                print(f"  {len(fr)} hourly ENTSO-E forecasts (France load) -> data/exog/")
+            except Exception as err:
+                print(f"  ENTSO-E forecasts unavailable ({err}).")
+        if frames:
+            exog = pd.concat(frames, axis=1)
 
     run(series, exog=exog, test_days=args.test_days, retrain_every=args.retrain_every)
 

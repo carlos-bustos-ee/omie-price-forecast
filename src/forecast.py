@@ -40,17 +40,25 @@ BASE_FEATURES = [f"dlag_{lag}" for lag in REL_LAGS] + [
     "is_weekend",
 ]
 
-# Exogenous features from REE/ESIOS day-ahead (D+1) forecasts. These are the
-# forecasts available BEFORE the D-1 auction, so they carry no look-ahead: the
-# net-load forecast (demand minus wind minus solar) is the single strongest
-# driver of the marginal price. ``d_netload_24`` mirrors the delta target — how
-# much tighter/looser the system is than the same hour yesterday.
+# Domestic exogenous features from REE/ESIOS day-ahead (D+1) forecasts. These are
+# available BEFORE the D-1 auction, so they carry no look-ahead: the net-load
+# forecast (demand minus wind minus solar) is the single strongest driver of the
+# marginal price. ``d_netload_24`` mirrors the delta target — how much
+# tighter/looser the system is than the same hour yesterday.
 EXOG_FEATURES = ["demand_fc", "wind_fc", "solar_fc", "netload_fc", "d_netload_24"]
+
+# Cross-border feature: France's day-ahead LOAD forecast (from ENTSO-E). High
+# French demand pulls power south over the interconnector and lifts the Spanish
+# price. Only load is used, NOT French wind/solar: under EU Reg. 543/2013 the
+# day-ahead load forecast is published >=2h before day-ahead gate closure (so it
+# is available at the ~12:00 D-1 MIBEL auction), whereas the wind/solar forecast
+# deadline is 18:00 D-1 — after the gate — so using it would be look-ahead.
+FR_EXOG_FEATURES = ["fr_load_fc", "d_fr_load_24"]
 
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
     """Base autoregressive features, plus any exogenous features present."""
-    return BASE_FEATURES + [c for c in EXOG_FEATURES if c in df.columns]
+    return BASE_FEATURES + [c for c in EXOG_FEATURES + FR_EXOG_FEATURES if c in df.columns]
 
 
 def make_features(series: pd.DataFrame, exog: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -73,11 +81,15 @@ def make_features(series: pd.DataFrame, exog: pd.DataFrame | None = None) -> pd.
     df["is_weekend"] = (df.index.dayofweek >= 5).astype(int)
     if exog is not None:
         ex = exog.reindex(df.index)
-        df["demand_fc"] = ex["demand_fc"]
-        df["wind_fc"] = ex["wind_fc"]
-        df["solar_fc"] = ex["solar_fc"]
-        df["netload_fc"] = ex["demand_fc"] - ex["wind_fc"] - ex["solar_fc"]
-        df["d_netload_24"] = df["netload_fc"] - df["netload_fc"].shift(24)
+        if {"demand_fc", "wind_fc", "solar_fc"}.issubset(ex.columns):  # Spain (ESIOS)
+            df["demand_fc"] = ex["demand_fc"]
+            df["wind_fc"] = ex["wind_fc"]
+            df["solar_fc"] = ex["solar_fc"]
+            df["netload_fc"] = ex["demand_fc"] - ex["wind_fc"] - ex["solar_fc"]
+            df["d_netload_24"] = df["netload_fc"] - df["netload_fc"].shift(24)
+        if "fr_load_fc" in ex.columns:  # France (ENTSO-E) — load only, see FR_EXOG_FEATURES
+            df["fr_load_fc"] = ex["fr_load_fc"]
+            df["d_fr_load_24"] = df["fr_load_fc"] - df["fr_load_fc"].shift(24)
     df["target_delta"] = df["price_eur_mwh"] - df["lag_24"]
     return df.dropna()
 
@@ -85,12 +97,18 @@ def make_features(series: pd.DataFrame, exog: pd.DataFrame | None = None) -> pd.
 # --------------------------------------------------------------------------- #
 # Models                                                                      #
 # --------------------------------------------------------------------------- #
-def _fit_set(train: pd.DataFrame, features: list[str]) -> tuple[HistGradientBoostingRegressor, dict]:
-    """One point model (mean) + one gradient-boosting model per quantile."""
+def _fit_point(train: pd.DataFrame, features: list[str]) -> HistGradientBoostingRegressor:
+    """The point (mean) gradient-boosting model on the delta target."""
     point = HistGradientBoostingRegressor(
         max_iter=500, learning_rate=0.05, early_stopping=False, random_state=42
     )
     point.fit(train[features], train["target_delta"])
+    return point
+
+
+def _fit_set(train: pd.DataFrame, features: list[str]) -> tuple[HistGradientBoostingRegressor, dict]:
+    """One point model (mean) + one gradient-boosting model per quantile."""
+    point = _fit_point(train, features)
     quantiles = {
         q: HistGradientBoostingRegressor(
             loss="quantile", quantile=q, max_iter=400, learning_rate=0.05,
@@ -185,6 +203,7 @@ def _fit_calibrated(train: pd.DataFrame, features: list[str], calib_days: int = 
 def backtest(
     df: pd.DataFrame, test_days: int = 28, retrain_every: int = 7,
     calibration: str = "global", features: list[str] | None = None,
+    fit_quantiles: bool = True, fit_lasso: bool = True,
 ) -> pd.DataFrame:
     """Expanding-window walk-forward evaluation over the last ``test_days``.
 
@@ -215,19 +234,26 @@ def backtest(
     for i, day in enumerate(days):
         if i % retrain_every == 0:
             train = df[df.index < day]
-            point, quantiles, k = _fit_calibrated(train, features, by_hour=by_hour)
-            lasso = _fit_lasso(train, features)
+            if fit_quantiles:
+                point, quantiles, k = _fit_calibrated(train, features, by_hour=by_hour)
+            else:
+                point = _fit_point(train, features)   # point-only variant (ablation legs)
+            if fit_lasso:
+                lasso = _fit_lasso(train, features)
         rows = df[(df.index >= day) & (df.index < day + pd.Timedelta(days=1))]
-        qp = _quantile_prices(quantiles, rows, features)
-        kk = np.array([k[h] for h in rows.index.hour]) if by_hour else k
         anchor = rows["lag_24"].to_numpy()
         preds.loc[rows.index, "point"] = anchor + point.predict(rows[features])
-        preds.loc[rows.index, "lasso"] = anchor + lasso.predict(rows[features])
-        preds.loc[rows.index, "q50"] = qp[0.5]
-        preds.loc[rows.index, "q10"] = qp[0.5] - kk * (qp[0.5] - qp[0.1])   # conformal widen
-        preds.loc[rows.index, "q90"] = qp[0.5] + kk * (qp[0.9] - qp[0.5])
+        if fit_lasso:
+            preds.loc[rows.index, "lasso"] = anchor + lasso.predict(rows[features])
+        if fit_quantiles:
+            qp = _quantile_prices(quantiles, rows, features)
+            kk = np.array([k[h] for h in rows.index.hour]) if by_hour else k
+            preds.loc[rows.index, "q50"] = qp[0.5]
+            preds.loc[rows.index, "q10"] = qp[0.5] - kk * (qp[0.5] - qp[0.1])   # conformal widen
+            preds.loc[rows.index, "q90"] = qp[0.5] + kk * (qp[0.9] - qp[0.5])
 
-    preds[["q10", "q50", "q90"]] = np.sort(preds[["q10", "q50", "q90"]].to_numpy(), axis=1)
+    if fit_quantiles:
+        preds[["q10", "q50", "q90"]] = np.sort(preds[["q10", "q50", "q90"]].to_numpy(), axis=1)
     return preds
 
 
@@ -242,7 +268,8 @@ def _pinball(y: pd.Series, yhat: pd.Series, q: float) -> float:
 def score(preds: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Point metrics (MAE/RMSE vs the naive-24h benchmark) plus probabilistic metrics."""
     y = preds["actual"]
-    names = [c for c in ["naive_24h", "lasso", "point_price_only", "point"] if c in preds.columns]
+    names = [c for c in ["naive_24h", "lasso", "point_price_only", "point_es", "point"]
+             if c in preds.columns]
     rows = []
     for name in names:
         err = preds[name] - y
@@ -320,18 +347,31 @@ def diebold_mariano(actual, pred_a, pred_b, hac_lag: int = 24, loss: str = "abs"
     for lag in range(1, hac_lag + 1):
         cov = np.mean(dm0[lag:] * dm0[:-lag])
         lrv += 2.0 * (1.0 - lag / (hac_lag + 1.0)) * cov   # Bartlett weight
+    if lrv <= 0:   # identical/degenerate forecasts -> no measurable difference
+        return 0.0, 1.0
     stat = float(d.mean() / np.sqrt(lrv / n))
     p = float(2.0 * stats.norm.cdf(-abs(stat)))
     return stat, p
 
 
 def significance_tests(preds: pd.DataFrame, hac_lag: int = 24) -> pd.DataFrame:
-    """Run the Diebold-Mariano tests that matter: is the gradient boosting model
-    significantly better than the naive benchmark and than the LASSO baseline,
-    and does the LASSO itself beat naive? Absolute-error loss, HAC variance."""
+    """Diebold-Mariano tests down the ablation ladder: does each layer add real
+    skill? Absolute-error loss, HAC variance. Pairs adapt to which forecasts are
+    present so the France (ENTSO-E) and Spain (ESIOS) contributions are isolated."""
     y = preds["actual"].to_numpy()
-    pairs = [("point", "naive_24h"), ("point", "point_price_only"),
-             ("point_price_only", "naive_24h"), ("lasso", "naive_24h")]
+    cols = preds.columns
+    pairs = [("point", "naive_24h")]                       # full model vs naive
+    if "point_es" in cols:
+        pairs.append(("point", "point_es"))               # what ENTSO-E (France) adds
+        pairs.append(("point_es", "naive_24h"))           # ESIOS model vs naive (backs the headline)
+        if "point_price_only" in cols:
+            pairs.append(("point_es", "point_price_only"))  # what ESIOS (Spain) adds
+    elif "point_price_only" in cols:
+        pairs.append(("point", "point_price_only"))       # what the exogenous set adds
+    if "point_price_only" in cols:
+        pairs.append(("point_price_only", "naive_24h"))
+    if "lasso" in cols:
+        pairs.append(("lasso", "naive_24h"))
     rows = []
     for a, b in pairs:
         if a not in preds.columns or b not in preds.columns:

@@ -3,3 +3,4 @@ pandas>=2.1
 scikit-learn>=1.4
 scipy>=1.11
 matplotlib>=3.8
+entsoe-py>=0.6   # ENTSO-E Transparency Platform client (cross-border features)

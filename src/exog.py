@@ -104,8 +104,10 @@ def _download(start: date, end: date) -> pd.DataFrame:
             time.sleep(0.3)  # be polite to the API
     df = pd.DataFrame(cols)
     full = pd.date_range(df.index.min(), df.index.max(), freq="h")
-    # forward-only fill: never borrow a later hour's value backward in time
-    return df.reindex(full).interpolate(limit=3, limit_direction="forward").ffill()
+    # Forward-fill the few missing hours. This never uses a future value: a filled
+    # hour only inherits an already-published value from the past. (Interpolation
+    # was avoided precisely because it blends in the next, later observation.)
+    return df.reindex(full).ffill()
 
 
 def _covers(cached: pd.DataFrame, start: date, end: date) -> bool:
