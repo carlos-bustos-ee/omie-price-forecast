@@ -23,6 +23,7 @@ import pandas as pd
 from scipy import stats
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import LassoCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -30,7 +31,7 @@ REL_LAGS = (48, 72, 168)
 QUANTILES = (0.1, 0.5, 0.9)
 TARGET_COVERAGE = 0.80
 
-FEATURES = [f"dlag_{lag}" for lag in REL_LAGS] + [
+BASE_FEATURES = [f"dlag_{lag}" for lag in REL_LAGS] + [
     "droll_24",
     "droll_168",
     "hour",
@@ -39,9 +40,27 @@ FEATURES = [f"dlag_{lag}" for lag in REL_LAGS] + [
     "is_weekend",
 ]
 
+# Exogenous features from REE/ESIOS day-ahead (D+1) forecasts. These are the
+# forecasts available BEFORE the D-1 auction, so they carry no look-ahead: the
+# net-load forecast (demand minus wind minus solar) is the single strongest
+# driver of the marginal price. ``d_netload_24`` mirrors the delta target — how
+# much tighter/looser the system is than the same hour yesterday.
+EXOG_FEATURES = ["demand_fc", "wind_fc", "solar_fc", "netload_fc", "d_netload_24"]
 
-def make_features(series: pd.DataFrame) -> pd.DataFrame:
-    """Build the supervised frame. Anchor: lag_24 (yesterday, same hour)."""
+
+def feature_columns(df: pd.DataFrame) -> list[str]:
+    """Base autoregressive features, plus any exogenous features present."""
+    return BASE_FEATURES + [c for c in EXOG_FEATURES if c in df.columns]
+
+
+def make_features(series: pd.DataFrame, exog: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Build the supervised frame. Anchor: lag_24 (yesterday, same hour).
+
+    If ``exog`` (hourly demand_fc/wind_fc/solar_fc, MW) is given, its day-ahead
+    forecast for each delivery hour is joined on the target timestamp — legitimate
+    because those forecasts are published before the auction — and turned into a
+    net-load level and its change versus the same hour yesterday.
+    """
     df = series.copy()
     df["lag_24"] = df["price_eur_mwh"].shift(24)
     for lag in REL_LAGS:
@@ -52,6 +71,13 @@ def make_features(series: pd.DataFrame) -> pd.DataFrame:
     df["dayofweek"] = df.index.dayofweek
     df["month"] = df.index.month
     df["is_weekend"] = (df.index.dayofweek >= 5).astype(int)
+    if exog is not None:
+        ex = exog.reindex(df.index)
+        df["demand_fc"] = ex["demand_fc"]
+        df["wind_fc"] = ex["wind_fc"]
+        df["solar_fc"] = ex["solar_fc"]
+        df["netload_fc"] = ex["demand_fc"] - ex["wind_fc"] - ex["solar_fc"]
+        df["d_netload_24"] = df["netload_fc"] - df["netload_fc"].shift(24)
     df["target_delta"] = df["price_eur_mwh"] - df["lag_24"]
     return df.dropna()
 
@@ -59,28 +85,28 @@ def make_features(series: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Models                                                                      #
 # --------------------------------------------------------------------------- #
-def _fit_set(train: pd.DataFrame) -> tuple[HistGradientBoostingRegressor, dict]:
+def _fit_set(train: pd.DataFrame, features: list[str]) -> tuple[HistGradientBoostingRegressor, dict]:
     """One point model (mean) + one gradient-boosting model per quantile."""
     point = HistGradientBoostingRegressor(
         max_iter=500, learning_rate=0.05, early_stopping=False, random_state=42
     )
-    point.fit(train[FEATURES], train["target_delta"])
+    point.fit(train[features], train["target_delta"])
     quantiles = {
         q: HistGradientBoostingRegressor(
             loss="quantile", quantile=q, max_iter=400, learning_rate=0.05,
             early_stopping=False, random_state=42,
-        ).fit(train[FEATURES], train["target_delta"])
+        ).fit(train[features], train["target_delta"])
         for q in QUANTILES
     }
     return point, quantiles
 
 
-def _quantile_prices(quantiles: dict, rows: pd.DataFrame) -> dict:
+def _quantile_prices(quantiles: dict, rows: pd.DataFrame, features: list[str]) -> dict:
     anchor = rows["lag_24"].to_numpy()
-    return {q: anchor + quantiles[q].predict(rows[FEATURES]) for q in QUANTILES}
+    return {q: anchor + quantiles[q].predict(rows[features]) for q in QUANTILES}
 
 
-def _fit_lasso(train: pd.DataFrame):
+def _fit_lasso(train: pd.DataFrame, features: list[str]):
     """Regularized linear autoregressive baseline (standardized features + LASSO,
     alpha chosen by cross-validation). This is the workhorse benchmark of the
     electricity-price-forecasting literature (the linear half of Lago et al.'s
@@ -89,9 +115,11 @@ def _fit_lasso(train: pd.DataFrame):
     modelling the correction on top of the naive forecast."""
     model = make_pipeline(
         StandardScaler(),
-        LassoCV(cv=5, max_iter=10000, random_state=42),
+        # TimeSeriesSplit (not plain K-fold) so alpha is chosen without letting
+        # future folds inform the past — consistent with the walk-forward design.
+        LassoCV(cv=TimeSeriesSplit(5), max_iter=10000, random_state=42),
     )
-    model.fit(train[FEATURES], train["target_delta"])
+    model.fit(train[features], train["target_delta"])
     return model
 
 
@@ -131,7 +159,8 @@ def _calibrate_width_by_hour(
     return ks
 
 
-def _fit_calibrated(train: pd.DataFrame, calib_days: int = 21, by_hour: bool = False):
+def _fit_calibrated(train: pd.DataFrame, features: list[str], calib_days: int = 21,
+                    by_hour: bool = False):
     """Fit models on full train; learn the conformal width on a held-out tail.
 
     Returns ``k`` as a single float (global calibration) or a ``{hour: k}`` dict
@@ -139,14 +168,14 @@ def _fit_calibrated(train: pd.DataFrame, calib_days: int = 21, by_hour: bool = F
     """
     n_calib = calib_days * 24
     inner, calib = train.iloc[:-n_calib], train.iloc[-n_calib:]
-    _, quant_inner = _fit_set(inner)
-    qp_calib = _quantile_prices(quant_inner, calib)
+    _, quant_inner = _fit_set(inner, features)
+    qp_calib = _quantile_prices(quant_inner, calib, features)
     y_calib = calib["price_eur_mwh"].to_numpy()
     if by_hour:
         k = _calibrate_width_by_hour(y_calib, qp_calib, calib.index.hour.to_numpy())
     else:
         k = _calibrate_width(y_calib, qp_calib)
-    point, quantiles = _fit_set(train)   # deploy on all data
+    point, quantiles = _fit_set(train, features)   # deploy on all data
     return point, quantiles, k
 
 
@@ -155,7 +184,7 @@ def _fit_calibrated(train: pd.DataFrame, calib_days: int = 21, by_hour: bool = F
 # --------------------------------------------------------------------------- #
 def backtest(
     df: pd.DataFrame, test_days: int = 28, retrain_every: int = 7,
-    calibration: str = "global",
+    calibration: str = "global", features: list[str] | None = None,
 ) -> pd.DataFrame:
     """Expanding-window walk-forward evaluation over the last ``test_days``.
 
@@ -173,6 +202,7 @@ def backtest(
     kept for when more calibration history is available.
     """
     by_hour = calibration == "hourly"
+    features = features if features is not None else feature_columns(df)
     cutoff = df.index.max().normalize() - pd.Timedelta(days=test_days - 1)
     test_index = df.index[df.index >= cutoff]
     days = sorted({d.normalize() for d in test_index})
@@ -185,14 +215,14 @@ def backtest(
     for i, day in enumerate(days):
         if i % retrain_every == 0:
             train = df[df.index < day]
-            point, quantiles, k = _fit_calibrated(train, by_hour=by_hour)
-            lasso = _fit_lasso(train)
+            point, quantiles, k = _fit_calibrated(train, features, by_hour=by_hour)
+            lasso = _fit_lasso(train, features)
         rows = df[(df.index >= day) & (df.index < day + pd.Timedelta(days=1))]
-        qp = _quantile_prices(quantiles, rows)
+        qp = _quantile_prices(quantiles, rows, features)
         kk = np.array([k[h] for h in rows.index.hour]) if by_hour else k
         anchor = rows["lag_24"].to_numpy()
-        preds.loc[rows.index, "point"] = anchor + point.predict(rows[FEATURES])
-        preds.loc[rows.index, "lasso"] = anchor + lasso.predict(rows[FEATURES])
+        preds.loc[rows.index, "point"] = anchor + point.predict(rows[features])
+        preds.loc[rows.index, "lasso"] = anchor + lasso.predict(rows[features])
         preds.loc[rows.index, "q50"] = qp[0.5]
         preds.loc[rows.index, "q10"] = qp[0.5] - kk * (qp[0.5] - qp[0.1])   # conformal widen
         preds.loc[rows.index, "q90"] = qp[0.5] + kk * (qp[0.9] - qp[0.5])
@@ -212,7 +242,7 @@ def _pinball(y: pd.Series, yhat: pd.Series, q: float) -> float:
 def score(preds: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Point metrics (MAE/RMSE vs the naive-24h benchmark) plus probabilistic metrics."""
     y = preds["actual"]
-    names = [c for c in ["naive_24h", "lasso", "point"] if c in preds.columns]
+    names = [c for c in ["naive_24h", "lasso", "point_price_only", "point"] if c in preds.columns]
     rows = []
     for name in names:
         err = preds[name] - y
@@ -300,7 +330,8 @@ def significance_tests(preds: pd.DataFrame, hac_lag: int = 24) -> pd.DataFrame:
     significantly better than the naive benchmark and than the LASSO baseline,
     and does the LASSO itself beat naive? Absolute-error loss, HAC variance."""
     y = preds["actual"].to_numpy()
-    pairs = [("point", "naive_24h"), ("point", "lasso"), ("lasso", "naive_24h")]
+    pairs = [("point", "naive_24h"), ("point", "point_price_only"),
+             ("point_price_only", "naive_24h"), ("lasso", "naive_24h")]
     rows = []
     for a, b in pairs:
         if a not in preds.columns or b not in preds.columns:

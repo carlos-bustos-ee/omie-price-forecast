@@ -1,137 +1,155 @@
 # OMIE Day-Ahead Electricity Price Forecasting (Spain)
 
 Point **and probabilistic** day-ahead forecasts for the Spanish zone of the Iberian
-electricity market (MIBEL), using only public data from [OMIE](https://www.omie.es/),
-the market operator. The pipeline downloads real market prices, engineers a
-leakage-free feature set, and evaluates the models with a **walk-forward backtest**
-that a trading desk would recognise — a naive and a LASSO benchmark, a **conformally
-calibrated P10–P90 interval**, and a **Diebold–Mariano significance test**, not just a
-single point number.
+electricity market (MIBEL). The pipeline downloads real market prices from
+[OMIE](https://www.omie.es/) and the day-ahead **demand / wind / solar forecasts**
+from [ESIOS (REE)](https://www.esios.ree.es/), engineers a feature set that is
+**leakage-free by construction and verified empirically** (below), and evaluates the models
+with a **walk-forward backtest** a trading desk would
+recognise — a naive and a LASSO benchmark, a **conformally calibrated P10–P90
+interval**, and a **Diebold–Mariano significance test**, not just a single point number.
 
 **Headline (120-day walk-forward, weekly retrain, ~14 months of history):**
 
-| Model | MAE (€/MWh) | RMSE (€/MWh) | vs. naive-24h |
-|---|---|---|---|
-| Naive 24h (yesterday's price) | 16.28 | 24.87 | — |
-| LASSO autoregressive baseline | 15.83 | 21.34 | +2.8% MAE |
-| **Gradient boosting (point)** | **15.37** | **21.25** | **+5.6% MAE** |
+| Model | MAE (€/MWh) | RMSE (€/MWh) | vs. naive-24h | Better than naive? (DM) |
+|---|---|---|---|---|
+| Naive 24h (yesterday's price) | 16.28 | 24.87 | — | — |
+| LASSO autoregressive baseline | 15.39 | 21.48 | +5.5% | Barely (p = 0.03) |
+| Gradient boosting, price-only | 15.37 | 21.25 | +5.6% | No (p = 0.18) |
+| **Gradient boosting + ESIOS forecasts** | **9.67** | **13.54** | **+40.6%** | **Yes (p ≈ 2e-17)** |
 
-Probabilistic (gradient boosting): **pinball loss 4.83 €/MWh**, **P10–P90 coverage 82.5%**
+Probabilistic (the +ESIOS model): **pinball loss 3.26 €/MWh**, **P10–P90 coverage 83.9%**
 (nominal 80%) after conformal calibration.
 
 | Point forecast | Probabilistic forecast |
 |---|---|
 | ![point](results/forecast_point_last14d.png) | ![fan](results/forecast_fan_last14d.png) |
 
-The gradient boosting model has the lowest error of the three, and the probabilistic
-intervals are well-calibrated. But is a −5.6% point gain *real* or luck? That question —
-and the honest answer — is below.
+The one lesson this project is built to show: **on ~14 months of data, autoregressive
+price history alone cannot beat the naive benchmark by a statistically significant margin —
+but the day-ahead demand/wind/solar forecast can, decisively.** The next section proves it
+rather than asserting it.
 
 ---
 
-## Is the point gain statistically significant? (Not yet — and saying so is the point)
+## What actually moves the needle (and how we know it isn't luck)
 
-A "−5.6% MAE" headline is worthless without asking whether it could be noise. Hourly
-forecast errors are strongly autocorrelated, so the **effective** sample is far smaller
-than the 2,880 test hours. The [Diebold–Mariano](https://en.wikipedia.org/wiki/Diebold%E2%80%93Mariano_test)
-test with a Newey–West (HAC) long-run variance is the honest way to check
-(`src/forecast.py: diebold_mariano`):
+A "−40% MAE" headline is worthless without asking whether it could be noise, and *which*
+ingredient earned it. Hourly forecast errors are strongly autocorrelated, so the
+**effective** sample is far smaller than the 2,880 test hours; the
+[Diebold–Mariano](https://en.wikipedia.org/wiki/Diebold%E2%80%93Mariano_test) test with a
+Newey–West (HAC) long-run variance is the honest check (`src/forecast.py: diebold_mariano`).
+Reading the ablation bottom-up:
 
 | Comparison | MAE (a) | MAE (b) | DM stat | p-value | a better at 5%? |
 |---|---|---|---|---|---|
-| Gradient boosting vs naive | 15.37 | 16.28 | −1.34 | 0.18 | **No** |
-| Gradient boosting vs LASSO | 15.37 | 15.83 | −1.20 | 0.23 | **No** |
-| LASSO vs naive | 15.83 | 16.28 | −0.86 | 0.39 | **No** |
+| LASSO vs naive | 15.39 | 16.28 | −2.14 | 0.03 | **Barely** |
+| GBM price-only vs naive | 15.37 | 16.28 | −1.34 | 0.18 | **No** |
+| **GBM +ESIOS vs GBM price-only** | 9.67 | 15.37 | −11.15 | 7e-29 | **Yes** |
+| **GBM +ESIOS vs naive** | 9.67 | 16.28 | −8.51 | 2e-17 | **Yes** |
 
-The ranking is consistent (boosting < LASSO < naive in error), but on this history none of
-the gaps is statistically distinguishable from zero at the 5% level. That is the correct,
-unglamorous conclusion — and exactly what a desk needs to hear before trusting a model with
-real money.
-
-Why report a *negative* result so prominently? Because an earlier **28-day summer** window
-of this same pipeline showed a much flashier **+15% MAE**. Extending the backtest to 120
-days and running the DM test revealed that number was optimistic — a seasonal artifact, not
-a durable edge. That is the entire reason to backtest over a long, varied window and to test
-significance, rather than quote one lucky month. The most likely path to a *significant*
-edge is the exogenous drivers on the roadmap (demand / wind / solar), or a price history
-longer than the ~14 months OMIE exposes here.
+- **Autoregression alone barely moves the needle.** The linear LASSO baseline squeaks past
+  naive (−5.5%, p = 0.03) and the price-only gradient boosting doesn't clear the bar at all
+  (−5.6% but p = 0.18) — a marginal edge at best from price history and calendar alone. An
+  earlier **28-day summer**
+  window of this same pipeline showed a flashy **+15% MAE**; extending to 120 days and
+  running DM revealed that was a seasonal artifact, not a durable edge. That is exactly why
+  you backtest over a long, varied window and test significance instead of quoting one lucky
+  month. (In much of the electricity-price-forecasting literature an autoregressive LEAR
+  model *does* clearly beat naive; that it barely does here is itself informative — the 2025–26
+  Spanish market is so dominated by swings between triple-digit evening peaks and zero/near-zero
+  midday solar hours that yesterday's price is a weak guide, and the fundamentals do the work.)
+- **The exogenous forecast is the edge.** Adding the ESIOS day-ahead demand/wind/solar
+  forecasts cuts MAE by a further ~37% (15.37 → 9.67) with a DM statistic of −11, i.e.
+  overwhelmingly significant. This is the market intuition made quantitative: in a
+  renewables-dominated system the clearing price is set by the **net load** (demand minus
+  wind minus solar), and the day-ahead forecast of that net load is public before the
+  auction. Knowing tomorrow's solar tells you when the price will collapse to zero — the
+  autoregressive model, however good, cannot.
 
 ## Why this is a fair evaluation (and not a leaky one)
 
-Prices for delivery day **D** clear at the **D-1** auction (published ~13:00 CET the
-day before). A real forecast for D, produced on the morning of D-1, already knows
-every price up to the end of D-1 — and nothing after. Three design choices keep the
-evaluation honest:
+Prices for delivery day **D** clear at the **D-1** auction (~12:00 CET the day before). A
+real forecast for D, produced that morning, may only use information already public by then.
+Four design choices keep the evaluation honest:
 
-1. **Feature window ≥ 24 h.** Every predictor is a lag of 24 hours or more, so no
-   feature ever uses information that wouldn't exist at forecast time. No leakage.
-2. **Delta target.** Price *levels* are non-stationary and tree ensembles can't
-   extrapolate beyond their training range, so the models learn the **correction
-   against the 24h-lagged price** (the naive benchmark). Both the boosting and the LASSO
-   predict this delta, so all three models are compared on identical, honest footing.
-3. **Walk-forward backtest.** Instead of one lucky train/test split, the models are
-   refit weekly and always scored on days they have *never seen*. The reported numbers
-   are the average over a rolling 120-day out-of-sample window.
+1. **Price features are lagged ≥ 24 h.** Every autoregressive predictor is a lag of 24 hours
+   or more, so none uses a price that wouldn't exist at forecast time.
+2. **Exogenous features are day-ahead *forecasts*, not realised values.** Using the realised
+   demand/wind/solar of day D would be look-ahead leakage — nobody knows it at the auction.
+   The pipeline uses ESIOS's **"Previsión diaria D+1"** series (indicators 1775/1777/1779):
+   these are the forecasts REE publishes the day before, so they are genuinely available to a
+   market participant, and they are exactly what a real price forecaster feeds in.
+3. **Delta target.** Price *levels* are non-stationary and tree ensembles can't extrapolate
+   beyond their training range, so every model learns the **correction against the 24h-lagged
+   price**; all models are compared on identical footing.
+4. **Walk-forward backtest.** Models are refit weekly and always scored on days they have
+   *never seen*; the numbers are the average over a rolling 120-day out-of-sample window.
 
-The naive-24h benchmark is genuinely hard to beat in this market (it *is* the standard
-reference), so a single-digit MAE reduction using only price history and calendar features
-is a modest, honest result — and the harness is built to measure it without fooling itself.
+**The exogenous features are verified to be genuine forecasts, not outturn in disguise.**
+The whole leakage-free claim on point 2 rests on the ESIOS series being the day-ahead
+forecast and not a value silently revised toward the realised outturn. That is *tested*, not
+assumed (`src/exog.py: forecast_vs_realised`): each forecast is compared against its realised
+counterpart, and the errors are exactly those of a real day-ahead forecast — nowhere near the
+~0 that outturn contamination would produce.
 
-## Probabilistic forecasting
+| Series | forecast vs realised, normalised MAE | typical day-ahead error |
+|---|---|---|
+| Demand | 1.5% | ~1–3% ✓ |
+| Solar PV | 16.1% | ~5–15% ✓ |
+| Wind | 22.6% | ~15–30% ✓ |
 
-A point forecast is not enough for a trading or risk decision — you need the
-*distribution*. The pipeline trains gradient-boosting **quantile** models (P10/P50/P90)
-and then applies a **split-conformal calibration**: the raw quantile band is overconfident
-(empirical coverage well short of the 80% nominal), so a width multiplier is learned on
-held-out data and applied to the interval. Calibrated coverage lands at **82.5%**, and the
-band widens in the volatile ramps and solar-driven troughs — where uncertainty really is
-higher.
+A 22.6% wind error is emphatically a *forecast*; if the feature were leaking outturn it would
+be near zero and the whole −40% would be spurious. It isn't.
 
 ## Where the model earns its keep (error by hour of day)
 
-A single headline MAE hides *where* the gain comes from. Breaking the 120-day backtest down
-by hour of day tells the real story:
-
 ![error by hour](results/error_by_hour.png)
 
-- **In the flat hours the model can't add much.** Overnight (00–06h) and especially the
-  low, stable midday hours (11–16h, naive MAE ~10 €/MWh) leave little structure to exploit —
-  the boosting model tracks the naive and, in a few midday hours, is even marginally worse.
-- **It earns its keep in the ramps.** In the morning solar build-up the naive error blows up
-  to **~27 €/MWh** while the model holds ~19 (hour 8: **−29%**), and the evening ramp shows
-  the same pattern (hours 18–19: **−15%**). Exactly the volatile hours a trader cares about
-  are the hours the model helps most — which is also *why* the aggregate gain is modest: the
-  model wins where errors are large and ties where they are small.
-- **Coverage is honest and fairly flat.** Over 120 days the P10–P90 band runs 76–89% per
-  hour around the 80% target — steadier than on a short window.
+Breaking the 120-day backtest down by hour shows the exogenous model gains everywhere, but
+most in the **morning solar ramp** (hours 7–9, up to **−56%** vs naive) and the **evening
+ramp** (hours 18–19, ~**−52%**) — precisely the volatile hours a trader cares about, and
+precisely where knowing tomorrow's wind and solar matters. The P10–P90 band tracks the 80%
+target across the day (per-hour coverage 75–91%). Numbers per hour: `results/metrics_by_hour.csv`.
 
-Numbers per hour are in `results/metrics_by_hour.csv`.
+## Probabilistic forecasting
 
-### Experiment: does hour-conditional calibration help? (No — and that's the point)
+A point forecast is not enough for a risk decision — you need the *distribution*. The
+pipeline trains gradient-boosting **quantile** models (P10/P50/P90) and applies a
+**split-conformal calibration**: the raw quantile band is overconfident, so a width
+multiplier learned on held-out data widens it to the nominal 80%. Calibrated coverage lands
+at **83.9%**, widening in the volatile ramps and solar-driven troughs where uncertainty is
+genuinely higher.
 
-The uneven coverage invites calibrating the conformal width **per hour** instead of
-globally. It's implemented (`backtest(..., calibration="hourly")`) and tested head-to-head
-on the same models over the 120-day window:
+### Experiment: does hour-conditional calibration help?
+
+The obvious refinement is to calibrate the conformal width **per hour** rather than globally.
+It's implemented (`backtest(..., calibration="hourly")`) and tested head-to-head over the
+120-day window:
 
 | Calibration | Pinball ↓ | Overall coverage | Hourly coverage spread (mean \|cov−80%\|) |
 |---|---|---|---|
-| **Global (shipped)** | **4.83** | 82.5% | 3.7 pp |
-| Hourly | 4.98 | 79.1% | 3.0 pp |
+| **Global (shipped)** | 3.264 | 83.9% | 4.5 pp |
+| Hourly | 3.260 | 81.8% | 3.2 pp |
 
-Per-hour calibration flattens the hourly spread a little, but with only a **21-day**
-calibration window it **overfits**: the proper scoring rule (pinball) gets *worse*. So the
-shipped default stays **global**, and the hourly option is kept for when there's enough
-calibration history (or a shrinkage prior toward the global width) to estimate 24
-multipliers without chasing noise. Rejecting a plausible idea on out-of-sample evidence is
-the point — not every added knob is an improvement.
+With the stronger (+ESIOS) model the two are essentially tied on the proper scoring rule
+(pinball), while hourly nudges overall coverage closer to 80% and flattens the per-hour
+spread. The gain is marginal and buys 24 extra parameters estimated on a 21-day window, so
+the shipped default stays **global** for robustness; `calibration="hourly"` is available when
+more calibration history warrants it. (On the earlier price-only model hourly clearly
+*overfit* — worse pinball; the better base model narrowed the gap.)
 
 ## Data
 
-- **Source:** OMIE public daily files (`marginalpdbc_YYYYMMDD.1`), downloaded and cached
-  by `src/download.py`. No API key required.
-- **Granularity:** since the EU switch to 15-minute market time units (Oct 2025) the
-  files carry 96 periods/day; earlier files are hourly. Quarter-hours are averaged into
-  hours so the whole history is comparable (`src/dataset.py`).
+- **Prices** — OMIE public daily files (`marginalpdbc_YYYYMMDD.1`), downloaded and cached by
+  `src/download.py`. No key required. Since the EU 15-minute market switch (Oct 2025) files
+  carry 96 periods/day; quarter-hours are averaged to hours so the whole history is
+  comparable (`src/dataset.py`).
+- **Exogenous forecasts** — ESIOS (REE) day-ahead demand (1775), wind (1777) and solar PV
+  (1779), peninsular, hourly, via `src/exog.py`. Needs a free personal token (below). The
+  downloaded series is cached to `data/exog/esios_forecasts.csv` and **committed**, so the
+  study reproduces without a token and no data is ever re-requested (ESIOS's responsible-use
+  terms).
 - **History used:** ~420 delivery days (~10,000 hourly prices).
 
 ## Run it
@@ -142,6 +160,11 @@ python -m venv .venv
 .venv/Scripts/python -m src.pipeline --days 420 --test-days 120 --retrain-every 7
 ```
 
+The cached ESIOS data is committed, so it runs out of the box. To **refresh** the exogenous
+data you need a free ESIOS token (request at <https://www.esios.ree.es/es/pagina/api>): put
+it in a `.env` file as `ESIOS_TOKEN=...` (git-ignored). To run the **price-only** model
+without any token, pass `--no-exog`.
+
 Outputs (in `results/`): `metrics.csv`, `metrics_probabilistic.csv`, `metrics_by_hour.csv`,
 `significance_dm.csv`, `backtest_predictions.csv`, and the three plots above.
 
@@ -151,23 +174,31 @@ Outputs (in `results/`): `metrics.csv`, `metrics_probabilistic.csv`, `metrics_by
 src/
   download.py    # fetch + cache OMIE daily price files
   dataset.py     # parse (hourly + 15-min formats) into a tidy hourly series
-  forecast.py    # features, GB + quantile + LASSO models, conformal calibration,
-                 # walk-forward backtest, scoring, Diebold-Mariano test
-  pipeline.py    # end-to-end: download -> dataset -> backtest -> metrics + plots
+  exog.py        # fetch + cache ESIOS day-ahead demand/wind/solar forecasts
+  forecast.py    # features (autoregressive + exogenous), GB + quantile + LASSO models,
+                 # conformal calibration, walk-forward backtest, scoring, Diebold-Mariano
+  pipeline.py    # end-to-end: download -> dataset + exog -> backtest -> metrics + plots
 ```
+
+## Limitations & honest caveats
+
+- **Forecast, not actuals.** The exogenous features are ESIOS's archived day-ahead
+  ("Previsión diaria D+1") forecasts. If those series were ever silently revised with
+  outturn, some optimism could leak in; they are published as the day-ahead forecast and used
+  as such here.
+- **~14 months only.** OMIE exposes a limited public history; a longer record would tighten
+  every estimate. The DST period-to-hour mapping is approximate (fine for research, not
+  settlement).
+- **Point + interval, not a full density**, and no trading/P&L layer — the target is forecast
+  accuracy, honestly measured.
 
 ## Roadmap
 
-- **Exogenous drivers** — demand, wind and solar forecasts from ENTSO-E and ESIOS (REE).
-  The biggest remaining lever on point error, and the most likely route to a *statistically
-  significant* edge over naive.
-- **Stronger literature benchmarks** — a LASSO baseline and a Diebold–Mariano test are in
-  place; next is the full LEAR / DNN from [`epftoolbox`](https://github.com/jeslago/epftoolbox).
-- **Hour-conditional conformal calibration with shrinkage** — the per-hour version is
-  implemented but overfits a 21-day window (see the experiment above); shrink each hour's
-  width toward the global one, or calibrate on more history.
-- **More history / rolling-origin backtest** — the DM test shows 120 days still lacks the
-  power to prove significance; a longer price record would settle it.
+- **ENTSO-E cross-border features** — interconnector flows and neighbouring-area load, to
+  complement the domestic ESIOS drivers (API access granted and token in hand; integration next).
+- **Stronger literature benchmark** — the full LEAR / DNN from
+  [`epftoolbox`](https://github.com/jeslago/epftoolbox) alongside the current LASSO.
+- **Longer history / rolling-origin backtest** — to shrink the confidence intervals further.
 
 ## Author
 

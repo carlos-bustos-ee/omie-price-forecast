@@ -1,4 +1,5 @@
 comparison,mae_a,mae_b,dm_stat,p_value,a_better_at_5pct
-point vs naive_24h,15.369,16.277,-1.342,0.17961601718604792,False
-point vs lasso,15.369,15.825,-1.195,0.23227643052621094,False
-lasso vs naive_24h,15.825,16.277,-0.856,0.39205150034079594,False
+point vs naive_24h,9.669,16.277,-8.506,1.807297699604731e-17,True
+point vs point_price_only,9.669,15.369,-11.154,6.841450758821809e-29,True
+point_price_only vs naive_24h,15.369,16.277,-1.342,0.17961601718604792,False
+lasso vs naive_24h,15.388,16.277,-2.14,0.03237707285121031,True

@@ -15,18 +15,40 @@ import matplotlib.pyplot as plt
 
 from .dataset import build_series
 from .download import download_range
-from .forecast import backtest, make_features, score, score_by_hour, significance_tests
+from .exog import load_exog
+from .forecast import (
+    BASE_FEATURES,
+    backtest,
+    feature_columns,
+    make_features,
+    score,
+    score_by_hour,
+    significance_tests,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def run(series, test_days: int = 120, retrain_every: int = 7) -> None:
+def run(series, exog=None, test_days: int = 120, retrain_every: int = 7) -> None:
     """Backtest -> score -> significance -> save artifacts + plots. Takes a tidy
-    hourly price series so it can be driven from a live download or a cached CSV."""
-    df = make_features(series)
+    hourly price series (and optional ESIOS exogenous forecasts) so it can be
+    driven from a live download or a cached CSV.
+
+    With ``exog`` present the headline gradient-boosting model uses the day-ahead
+    demand/wind/solar forecasts; a second price-only backtest is run so the
+    ablation (``point`` vs ``point_price_only``) isolates what the exogenous
+    forecasts actually add, tested for significance with Diebold-Mariano.
+    """
+    df = make_features(series, exog=exog)
     print(f"  walk-forward backtest: last {test_days} days, retrain every "
           f"{retrain_every} days ...")
-    preds = backtest(df, test_days=test_days, retrain_every=retrain_every)
+    preds = backtest(df, test_days=test_days, retrain_every=retrain_every,
+                     features=feature_columns(df))
+    if exog is not None:
+        base = backtest(df, test_days=test_days, retrain_every=retrain_every,
+                        features=BASE_FEATURES)
+        preds["point_price_only"] = base["point"]
+        preds["lasso"] = base["lasso"]  # report the standard price-only LEAR baseline
     metrics, prob = score(preds)
     by_hour = score_by_hour(preds)
     sig = significance_tests(preds)
@@ -52,12 +74,15 @@ def run(series, test_days: int = 120, retrain_every: int = 7) -> None:
 
     window = preds.tail(14 * 24)
 
-    # 1) point forecast vs actual vs naive vs lasso
+    # 1) point forecast vs actual vs naive (+ the exogenous-features gain if present)
     fig, ax = plt.subplots(figsize=(13, 5))
     ax.plot(window.index, window["actual"], label="Actual", linewidth=1.4)
-    ax.plot(window.index, window["point"], label="Gradient boosting (point)", linewidth=1.1)
-    ax.plot(window.index, window["lasso"], label="LASSO baseline", linewidth=0.9,
-            color="tab:green", alpha=0.7)
+    gbm_label = ("Gradient boosting (+ ESIOS forecasts)" if "point_price_only" in preds.columns
+                 else "Gradient boosting (point)")
+    ax.plot(window.index, window["point"], label=gbm_label, linewidth=1.1)
+    if "point_price_only" in preds.columns:
+        ax.plot(window.index, window["point_price_only"], label="Gradient boosting (price-only)",
+                linewidth=0.9, color="tab:green", alpha=0.7)
     ax.plot(window.index, window["naive_24h"], label="Naive 24h", linewidth=0.9, alpha=0.5)
     ax.set_title("OMIE Spain day-ahead price — point forecast (last 14 days of backtest)")
     ax.set_ylabel("EUR/MWh")
@@ -115,6 +140,8 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=420, help="days of history to download")
     parser.add_argument("--test-days", type=int, default=120, help="walk-forward window (days)")
     parser.add_argument("--retrain-every", type=int, default=7, help="retrain cadence (days)")
+    parser.add_argument("--no-exog", action="store_true",
+                        help="skip ESIOS exogenous forecasts (price-only model)")
     args = parser.parse_args()
 
     end = date.today() - timedelta(days=1)
@@ -129,7 +156,15 @@ def main() -> None:
     series.to_csv(processed / "prices_hourly_es.csv")
     print(f"  {len(series)} hourly prices -> data/processed/prices_hourly_es.csv")
 
-    run(series, test_days=args.test_days, retrain_every=args.retrain_every)
+    exog = None
+    if not args.no_exog:
+        try:
+            exog = load_exog(series.index.min().date(), series.index.max().date())
+            print(f"  {len(exog)} hourly ESIOS forecasts (demand/wind/solar) -> data/exog/")
+        except Exception as err:  # no token and no cache -> fall back to price-only
+            print(f"  ESIOS forecasts unavailable ({err}); running price-only.")
+
+    run(series, exog=exog, test_days=args.test_days, retrain_every=args.retrain_every)
 
 
 if __name__ == "__main__":
